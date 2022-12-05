@@ -19,7 +19,6 @@ import logging
 import csv
 import json
 
-
 DATETIME_FORMAT = '%Y-%m-%dT%H:%M:%S'
 
 
@@ -64,37 +63,35 @@ def add_24h_if_before(arrtime, deptime):
         return arrtime
 
 
+def airport_timezone(airport_id, airport_timezones):
+    if airport_id in airport_timezones:
+        return airport_timezones[airport_id]
+    else:
+        return '37.41', '-92.35', u'America/Chicago'
+
+
 def tz_correct(fields, airport_timezones):
     fields['FL_DATE'] = fields['FL_DATE'].strftime('%Y-%m-%d')  # convert to a string so JSON code works
-    try:
-        # convert all times to UTC
-        dep_airport_id = fields["ORIGIN_AIRPORT_SEQ_ID"]
-        arr_airport_id = fields["DEST_AIRPORT_SEQ_ID"]
 
-        dep_timezone = airport_timezones[dep_airport_id][2]
-        arr_timezone = airport_timezones[arr_airport_id][2]
+    # convert all times to UTC
+    dep_airport_id = fields["ORIGIN_AIRPORT_SEQ_ID"]
+    arr_airport_id = fields["DEST_AIRPORT_SEQ_ID"]
+    fields["DEP_AIRPORT_LAT"], fields["DEP_AIRPORT_LON"], dep_timezone = airport_timezone(dep_airport_id,
+                                                                                          airport_timezones)
+    fields["ARR_AIRPORT_LAT"], fields["ARR_AIRPORT_LON"], arr_timezone = airport_timezone(arr_airport_id,
+                                                                                          airport_timezones)
 
-        for f in ["CRS_DEP_TIME", "DEP_TIME", "WHEELS_OFF"]:
-            fields[f], deptz = as_utc(fields["FL_DATE"], fields[f], dep_timezone)
-        for f in ["WHEELS_ON", "CRS_ARR_TIME", "ARR_TIME"]:
-            fields[f], arrtz = as_utc(fields["FL_DATE"], fields[f], arr_timezone)
+    for f in ["CRS_DEP_TIME", "DEP_TIME", "WHEELS_OFF"]:
+        fields[f], deptz = as_utc(fields["FL_DATE"], fields[f], dep_timezone)
+    for f in ["WHEELS_ON", "CRS_ARR_TIME", "ARR_TIME"]:
+        fields[f], arrtz = as_utc(fields["FL_DATE"], fields[f], arr_timezone)
 
-        for f in ["WHEELS_OFF", "WHEELS_ON", "CRS_ARR_TIME", "ARR_TIME"]:
-            fields[f] = add_24h_if_before(fields[f], fields["DEP_TIME"])
+    for f in ["WHEELS_OFF", "WHEELS_ON", "CRS_ARR_TIME", "ARR_TIME"]:
+        fields[f] = add_24h_if_before(fields[f], fields["DEP_TIME"])
 
-        fields["DEP_AIRPORT_LAT"] = airport_timezones[dep_airport_id][0]
-        fields["DEP_AIRPORT_LON"] = airport_timezones[dep_airport_id][1]
-        fields["DEP_AIRPORT_TZOFFSET"] = deptz
-        fields["ARR_AIRPORT_LAT"] = airport_timezones[arr_airport_id][0]
-        fields["ARR_AIRPORT_LON"] = airport_timezones[arr_airport_id][1]
-        fields["ARR_AIRPORT_TZOFFSET"] = arrtz
-        yield fields
-    except KeyError:
-        #logging.exception(f"Ignoring {fields} because airport is not known")
-        pass
-
-    except KeyError:
-        logging.exception("Ignoring field because airport is not known")
+    fields["DEP_AIRPORT_TZOFFSET"] = deptz
+    fields["ARR_AIRPORT_TZOFFSET"] = arrtz
+    yield fields
 
 
 def get_next_event(fields):
@@ -125,12 +122,18 @@ def create_event_row(fields):
     return featdict
 
 
-def run(project, bucket):
+def run(project, bucket, region):
     argv = [
         '--project={0}'.format(project),
+        '--job_name=timecorr',
+        '--save_main_session',
         '--staging_location=gs://{0}/flights/staging/'.format(bucket),
         '--temp_location=gs://{0}/flights/temp/'.format(bucket),
-        '--runner=DirectRunner'
+        '--setup_file=./setup.py',
+        '--autoscaling_algorithm=THROUGHPUT_BASED',
+        '--max_num_workers=8',
+        '--region={}'.format(region),
+        '--runner=DataflowRunner'
     ]
     airports_filename = 'gs://{}/flights/airports/airports.csv.gz'.format(bucket)
     flights_output = 'gs://{}/flights/tzcorr/all_flights'.format(bucket)
@@ -138,14 +141,14 @@ def run(project, bucket):
     with beam.Pipeline(argv=argv) as pipeline:
         airports = (pipeline
                     | 'airports:read' >> beam.io.ReadFromText(airports_filename)
-                    | beam.Filter(lambda line: "United States" in line)
+                    | 'airports:onlyUSA' >> beam.Filter(lambda line: "United States" in line)
                     | 'airports:fields' >> beam.Map(lambda line: next(csv.reader([line])))
                     | 'airports:tz' >> beam.Map(lambda fields: (fields[0], addtimezone(fields[21], fields[26])))
                     )
 
         flights = (pipeline
                    | 'flights:read' >> beam.io.ReadFromBigQuery(
-                    query='SELECT * FROM dsongcp.flights WHERE rand() < 0.001', use_standard_sql=True)
+                    query='SELECT * FROM ds_flights.flights', use_standard_sql=True)
                    | 'flights:tzcorr' >> beam.FlatMap(tz_correct, beam.pvalue.AsDict(airports))
                    )
 
@@ -153,59 +156,34 @@ def run(project, bucket):
          | 'flights:tostring' >> beam.Map(lambda fields: json.dumps(fields))
          | 'flights:gcsout' >> beam.io.textio.WriteToText(flights_output)
          )
-        
+
         flights_schema = ','.join([
-            'FL_DATE:date',
-            'UNIQUE_CARRIER:string',
-            'ORIGIN_AIRPORT_SEQ_ID:string',
-            'ORIGIN:string',
-            'DEST_AIRPORT_SEQ_ID:string',
-            'DEST:string',
-            'CRS_DEP_TIME:timestamp',
-            'DEP_TIME:timestamp',
-            'DEP_DELAY:float',
-            'TAXI_OUT:float',
-            'WHEELS_OFF:timestamp',
-            'WHEELS_ON:timestamp',
-            'TAXI_IN:float',
-            'CRS_ARR_TIME:timestamp',
-            'ARR_TIME:timestamp',
-            'ARR_DELAY:float',
-            'CANCELLED:boolean',
-            'DIVERTED:boolean',
-            'DISTANCE:float',
-            'DEP_AIRPORT_LAT:float',
-            'DEP_AIRPORT_LON:float',
-            'DEP_AIRPORT_TZOFFSET:float',
-            'ARR_AIRPORT_LAT:float',
-            'ARR_AIRPORT_LON:float',
-            'ARR_AIRPORT_TZOFFSET:float',
-            'Year:string'])
-        
-        # autodetect on JSON works, but is less reliable
-        #flights_schema = 'SCHEMA_AUTODETECT'
-        
-        (flights 
-         | 'flights:bqout' >> beam.io.WriteToBigQuery(
-                'dsongcp.flights_tzcorr', 
-                schema=flights_schema,
-                write_disposition=beam.io.BigQueryDisposition.WRITE_TRUNCATE,
-                create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
-                )
+            'FL_DATE:date,UNIQUE_CARRIER:string,ORIGIN_AIRPORT_SEQ_ID:string,ORIGIN:string',
+            'DEST_AIRPORT_SEQ_ID:string,DEST:string,CRS_DEP_TIME:timestamp,DEP_TIME:timestamp',
+            'DEP_DELAY:float,TAXI_OUT:float,WHEELS_OFF:timestamp,WHEELS_ON:timestamp,TAXI_IN:float',
+            'CRS_ARR_TIME:timestamp,ARR_TIME:timestamp,ARR_DELAY:float,CANCELLED:boolean',
+            'DIVERTED:boolean,DISTANCE:float',
+            'DEP_AIRPORT_LAT:float,DEP_AIRPORT_LON:float,DEP_AIRPORT_TZOFFSET:float',
+            'ARR_AIRPORT_LAT:float,ARR_AIRPORT_LON:float,ARR_AIRPORT_TZOFFSET:float'])
+        flights | 'flights:bqout' >> beam.io.WriteToBigQuery(
+            'ds_flights.flights_tzcorr', schema=flights_schema,
+            write_disposition=beam.io.BigQueryDisposition.WRITE_TRUNCATE,
+            create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
         )
-        
+
         events = flights | beam.FlatMap(get_next_event)
         events_schema = ','.join([flights_schema, 'EVENT_TYPE:string,EVENT_TIME:timestamp,EVENT_DATA:string'])
 
         (events
          | 'events:totablerow' >> beam.Map(lambda fields: create_event_row(fields))
          | 'events:bqout' >> beam.io.WriteToBigQuery(
-                'dsongcp.flights_simevents', schema=events_schema,
-                write_disposition=beam.io.BigQueryDisposition.WRITE_TRUNCATE,
-                create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
+                    'ds_flights.flights_simevents', schema=events_schema,
+                    write_disposition=beam.io.BigQueryDisposition.WRITE_TRUNCATE,
+                    create_disposition=beam.io.BigQueryDisposition.CREATE_IF_NEEDED
                 )
-        )
-        
+         )
+
+
 if __name__ == '__main__':
     import argparse
 
@@ -213,9 +191,12 @@ if __name__ == '__main__':
     parser.add_argument('-p', '--project', help='Unique project ID', required=True)
     parser.add_argument('-b', '--bucket', help='Bucket where gs://BUCKET/flights/airports/airports.csv.gz exists',
                         required=True)
+    parser.add_argument('-r', '--region',
+                        help='Region in which to run the Dataflow job. Choose the same region as your bucket.',
+                        required=True)
 
     args = vars(parser.parse_args())
 
     print("Correcting timestamps and writing to BigQuery dataset")
 
-    run(project=args['project'], bucket=args['bucket'])
+    run(project=args['project'], bucket=args['bucket'], region=args['region'])
